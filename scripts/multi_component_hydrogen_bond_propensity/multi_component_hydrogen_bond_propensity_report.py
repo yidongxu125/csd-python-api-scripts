@@ -1,13 +1,14 @@
 #!/usr/bin/env python
 #
 # This script can be used for any purpose without limitation subject to the
-# conditions at http://www.ccdc.cam.ac.uk/Community/Pages/Licences/v2.aspx
+# conditions at https://www.ccdc.cam.ac.uk/Community/Pages/Licences/v2.aspx
 #
 # This permission notice and the following statement of attribution must be
 # included in all copies or substantial portions of this script.
 #
 # 2017-08-10: Created by Andy Maloney, the Cambridge Crystallographic Data Centre
 # 2020-08-21: made available by the Cambridge Crystallographic Data Centre
+# 2025-01-08: Updated by Pablo Martinez-Bulit, the Cambridge Crystallographic Data Centre
 #
 """
 multi_component_hydrogen_bond_propensity_report.py
@@ -20,6 +21,7 @@ import glob
 import argparse
 import tempfile
 import subprocess
+import json
 
 import matplotlib
 
@@ -53,6 +55,52 @@ PAIR_TEMPLATE_FILE = os.path.join(SCRIPT_DIR, PAIR_TEMPLATE_FILENAME)
 
 
 ###############################################################################
+class PropensityCalc:
+    "HBP Calculator"
+    def __init__(self):
+        self.crystal = None
+        self.directory = None
+        self.fg_count = None
+        self.settings = self._hbp_settings()
+        self.hbp = CrystalDescriptors.HBondPropensities()
+
+    @staticmethod
+    def _hbp_settings():
+        settings = CrystalDescriptors.HBondPropensities.Settings()
+        settings.hbond_criterion.require_hydrogens = True
+        settings.hbond_criterion.path_length_range = (3, 999)
+
+        return settings
+
+    def calculate(self):
+        self.hbp.settings = self.settings
+        self.settings.working_directory = self.directory
+
+        # Set up the target structure for the calculation
+        self.hbp.set_target(self.crystal)
+        print(self.hbp.functional_groups)
+
+        # Generate Training Dataset
+        self.hbp.match_fitting_data(count=500)  # set to 500 for better representation of functional groups
+
+        self.hbp.analyse_fitting_data()
+
+        for d in self.hbp.donors:
+            print(d.identifier, d.npositive, d.nnegative)
+        for a in self.hbp.acceptors:
+            print(a.identifier, a.npositive, a.nnegative)
+
+        # Perform regression
+        model = self.hbp.perform_regression()
+
+        print(model.equation)
+        print('Area under ROC curve: {} -- {}'.format(round(model.area_under_roc_curve, 3), model.advice_comment))
+
+        propensities = self.hbp.calculate_propensities()
+
+        return propensities, self.hbp.donors, self.hbp.acceptors
+
+
 def cm2inch(*tupl):
     inch = 2.54
     if isinstance(tupl[0], tuple):
@@ -118,44 +166,6 @@ def add_picture_subdoc(picture_location, docx_template, wd=7):
         docx_template, image_descriptor=picture_location, width=Cm(wd))
 
 
-def propensity_calc(crystal, directory):
-    # Perform a Hydrogen Bond Propensity calculation
-
-    # Provide settings for the calculation
-    settings = CrystalDescriptors.HBondPropensities.Settings()
-    settings.working_directory = directory
-    settings.hbond_criterion.require_hydrogens = True
-    settings.hbond_criterion.path_length_range = (3, 999)
-
-    # Set up the HBP calculator
-    hbp = CrystalDescriptors.HBondPropensities(settings)
-
-    # Set up the target structure for the calculation
-    hbp.set_target(crystal)
-
-    print(hbp.functional_groups)
-
-    # Generate Training Dataset
-
-    hbp.match_fitting_data(count=500)  # set to >300, preferably 500 for better representation of functional groups
-
-    hbp.analyse_fitting_data()
-
-    for d in hbp.donors:
-        print(d.identifier, d.npositive, d.nnegative)
-    for a in hbp.acceptors:
-        print(a.identifier, a.npositive, a.nnegative)
-
-    # Perform regression
-    model = hbp.perform_regression()
-    print(model.equation)
-    print('Area under ROC curve: {} -- {}'.format(round(model.area_under_roc_curve, 3), model.advice_comment))
-    hbp.calculate_propensities()
-    propensities = hbp.inter_propensities
-
-    return propensities, hbp.donors, hbp.acceptors
-
-
 def coordination_scores_calc(crystal, directory):
     # Calculate coordination scores for the target structure
 
@@ -180,19 +190,27 @@ def format_scores(scores, das, d_type):
     return formatted_scores
 
 
-def get_mc_scores(propensities, identifier):
+def get_mc_scores(propensities, identifier, ignore_intra:bool):
     # Calculates the multi-component scores from the individual HBP calculation
     AA_propensities = []
     BB_propensities = []
     AB_propensities = []
     BA_propensities = []
+    AA_intra_propensities = []
+    BB_intra_propensities = []
 
     for p in propensities:
+        if ignore_intra and not p.is_intermolecular:
+            continue
         t = "%s_d" % p.donor_label.split(" ")[0], "%s_a" % p.acceptor_label.split(" ")[0]
         if '_A_' in t[0] and '_A_' in t[1]:
             AA_propensities.append(p.propensity)
+            if not p.is_intermolecular:
+                AA_intra_propensities.append(p.propensity)
         elif '_B_' in t[0] and '_B_' in t[1]:
             BB_propensities.append(p.propensity)
+            if not p.is_intermolecular:
+                BB_intra_propensities.append(p.propensity)
         elif '_A_' in t[0] and '_B_' in t[1]:
             AB_propensities.append(p.propensity)
         elif '_B_' in t[0] and '_A_' in t[1]:
@@ -202,9 +220,11 @@ def get_mc_scores(propensities, identifier):
     max_AB = max(AB_propensities) if len(AB_propensities) > 0 else 0.0
     max_BA = max(BA_propensities) if len(BA_propensities) > 0 else 0.0
     max_list = [max_AA, max_BB, max_AB, max_BA]
-    max_keys = ['A:A', 'B:B', 'A:B', 'B:A']
     max_mc = max(max_list[2], max_list[3])
     max_sc = max(max_list[0], max_list[1])
+
+    max_keys = ['A:A*', 'B:B*', 'A:B', 'B:A'] if max_sc in AA_intra_propensities or max_sc in BB_intra_propensities \
+        else ['A:A', 'B:B', 'A:B', 'B:A']
 
     return [round((max_mc - max_sc), 2),
             max_keys[max_list.index(max(max_list))],
@@ -214,21 +234,21 @@ def get_mc_scores(propensities, identifier):
             identifier]
 
 
-def make_pair_file(api_molecule, tempdir, f, i):
+def make_pair_file(api_molecule, tempdir, f):
     # Creates a file for the api/coformer pair
     with io.MoleculeReader(f) as reader:
         coformer_molecule = reader[0]
         coformer_name = coformer_molecule.identifier
-        molecule_pair = make_molecule_pair(api_molecule, coformer_molecule, i)
+        molecule_pair = make_molecule_pair(api_molecule, coformer_molecule)
         molecule_file = os.path.join(tempdir, '%s.mol2' % molecule_pair.identifier)
         with io.MoleculeWriter(molecule_file) as writer:
             writer.write(molecule_pair)
     return molecule_file, coformer_name
 
 
-def make_molecule_pair(api_molecule, coformer_molecule, i):
+def make_molecule_pair(api_molecule, coformer_molecule):
     # Creates the multi-component system for each api/coformer pair
-    new_file_name = '%s_%d' % (api_molecule.identifier, i)
+    new_file_name = '%s--%s' % (api_molecule.identifier, coformer_molecule.identifier)
     molecule_pair = molecule.Molecule(new_file_name)
     molecule_pair.add_molecule(api_molecule)
     molecule_pair.add_molecule(coformer_molecule)
@@ -313,7 +333,7 @@ def make_mc_report(identifier, results, directory, diagram_file, chart_file):
     launch_word_processor(output_file)
 
 
-def main(structure, work_directory, library, csdrefcode):
+def main(structure, work_directory, failure_directory, library, csdrefcode, ignore_intra, force_run):
     # This loads up the CSD if a refcode is requested, otherwise loads the structural file supplied
     if csdrefcode:
         try:
@@ -321,6 +341,10 @@ def main(structure, work_directory, library, csdrefcode):
         except RuntimeError:
             print('Error! %s is not in the database!' % structure)
             quit()
+        if io.CrystalReader('CSD').entry(structure).has_disorder and not force_run:
+            raise RuntimeError("Disorder can cause undefined behaviour. It is not advisable to run this "
+                               "script on disordered entries.\n To force this script to run on disordered entries"
+                               " use the flag --force_run_disordered.")
     else:
         crystal = io.CrystalReader(structure)[0]
 
@@ -334,31 +358,47 @@ def main(structure, work_directory, library, csdrefcode):
     coformer_files = glob.glob(os.path.join(library, '*.mol2'))
     tempdir = tempfile.mkdtemp()
     mc_dictionary = {}
+    failures = []
+
+    hbp_calculator = PropensityCalc()
 
     # for each coformer in the library, make a pair file for the api/coformer and run a HBP calculation
-    for i, f in enumerate(coformer_files):
-        molecule_file, coformer_name = make_pair_file(api_molecule, tempdir, f, i + 1)
+    for f in coformer_files:
+        molecule_file, coformer_name = make_pair_file(api_molecule, tempdir, f)
         print(coformer_name)
         crystal_reader = io.CrystalReader(molecule_file)
         crystal = crystal_reader[0]
 
         directory = os.path.join(os.path.abspath(work_directory), crystal.identifier)
-
-        try:
-            propensities, donors, acceptors = propensity_calc(crystal, directory)
-            coordination_scores = coordination_scores_calc(crystal, directory)
-            pair_output(crystal.identifier, propensities, donors, acceptors, coordination_scores, directory)
-            mc_dictionary[coformer_name] = get_mc_scores(propensities, crystal.identifier)
-
-        except RuntimeError:
-            print("Propensity calculation failure for %s!" % coformer_name)
-            mc_dictionary[coformer_name] = ["N/A", "N/A", "N/A", "N/A", "N/A", crystal.identifier]
+        if os.path.exists(os.path.join(directory, "success.json")):
+            with open(os.path.join(directory, "success.json"), "r") as file:
+                tloaded = json.load(file)
+            mc_dictionary[coformer_name] = tloaded
+        else:
+            try:
+                hbp_calculator.crystal = crystal
+                hbp_calculator.directory = directory
+                propensities, donors, acceptors = hbp_calculator.calculate()
+                coordination_scores = coordination_scores_calc(crystal, directory)
+                pair_output(crystal.identifier, propensities, donors, acceptors, coordination_scores, directory)
+                mc_dictionary[coformer_name] = get_mc_scores(propensities, crystal.identifier, ignore_intra)
+                with open(os.path.join(directory, "success.json"), "w") as file:
+                    json.dump(mc_dictionary[coformer_name], file)
+            except Exception as error_message:
+                print("Propensity calculation failure for %s!" % coformer_name)
+                error_string = f"{coformer_name}: {error_message}"
+                warnings.warn(error_string)
+                mc_dictionary[coformer_name] = ["N/A", "N/A", "N/A", "N/A", "N/A", crystal.identifier]
+                failures.append(error_string)
 
     # Make sense of the outputs of all the calculations
     mc_hbp_screen = sorted(mc_dictionary.items(), key=lambda e: 0 if e[1][0] == 'N/A' else e[1][0], reverse=True)
     diagram_file = make_diagram(api_molecule, work_directory)
-    chart_file = make_mc_chart(mc_hbp_screen, directory, api_molecule)
+    chart_file = make_mc_chart(mc_hbp_screen, work_directory, api_molecule)
     make_mc_report(structure, mc_hbp_screen, work_directory, diagram_file, chart_file)
+    if failure_directory is not None:
+        with open(os.path.join(failure_directory, 'failures.txt'), 'w', encoding='utf-8', newline='') as file:
+            file.write('\n'.join(map(str, failures)))
 
 
 if __name__ == '__main__':
@@ -396,21 +436,25 @@ if __name__ == '__main__':
     parser.add_argument('-c', '--coformer_library', type=str,
                         help='the directory of the desired coformer library',
                         default=ccdc_coformers_dir)
+    parser.add_argument('-f', '--failure_directory', type=str,
+                        help='The location where the failures file should be generated')
+    parser.add_argument('-i', '--ignore_intra', action='store_true', default=False,
+                        help='Ignore intramolecular hydrogen bonds when ranking pairs')
+    parser.add_argument('--force_run_disordered', action="store_true",
+                        help='Forces running the script on disordered entries. (NOT RECOMMENDED)', default=False)
 
     args = parser.parse_args()
-
     refcode = False
-
+    args.directory = os.path.abspath(args.directory)
     if not os.path.isfile(args.input_structure):
         if len(str(args.input_structure).split('.')) == 1:
             refcode = True
         else:
             parser.error('%s - file not found.' % args.input_structure)
-    if not refcode:
-        args.directory = os.path.dirname(os.path.abspath(args.input_structure))
-    elif not os.path.isdir(args.directory):
+    if not os.path.isdir(args.directory):
         os.makedirs(args.directory)
     if not os.path.isdir(args.coformer_library):
         parser.error('%s - library not found.' % args.coformer_library)
 
-    main(args.input_structure, args.directory, args.coformer_library, refcode)
+    main(args.input_structure, args.directory, args.failure_directory, args.coformer_library, refcode,
+         args.ignore_intra, args.force_run_disordered)
